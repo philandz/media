@@ -1,6 +1,6 @@
 pub mod token;
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{Datelike, Utc};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -12,11 +12,9 @@ use crate::manager::validate::{validate_content_type, validate_file_name, valida
 use crate::pb::common::base::{Base, BaseStatus};
 use crate::pb::shared::media::{MediaFile, MediaFileStatus, MediaUploadStatus};
 
-pub struct MediaBiz {
-    repo: MediaRepository,
-    config: philand_configs::MediaServiceConfig,
-    storage: MediaStorage,
-}
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
 
 pub struct InitUploadOutput {
     pub upload_id: String,
@@ -33,6 +31,9 @@ pub struct CompleteUploadOutput {
     pub status: String,
     pub object_key: String,
     pub bucket: String,
+    pub etag: String,
+    pub confirmed_size: u64,
+    pub public_url: String,
 }
 
 pub struct FileOutput {
@@ -40,9 +41,17 @@ pub struct FileOutput {
     pub bucket: String,
     pub object_key: String,
     pub content_type: String,
+    pub original_name: String,
     pub size: u64,
     pub status: String,
+    pub org_id: String,
     pub created_at: i64,
+    pub public_url: String,
+}
+
+pub struct ListFilesOutput {
+    pub files: Vec<FileOutput>,
+    pub total: u32,
 }
 
 pub struct FileDownloadUrlOutput {
@@ -51,11 +60,9 @@ pub struct FileDownloadUrlOutput {
     pub expires_at: i64,
 }
 
-impl InitUploadOutput {
-    pub fn required_content_type(&self) -> String {
-        self.content_type.clone()
-    }
-}
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
 
 impl CompleteUploadOutput {
     pub fn upload_status_enum(&self) -> i32 {
@@ -95,9 +102,23 @@ impl FileOutput {
             size: self.size as i64,
             etag: String::new(),
             file_status: status,
-            org_id: String::new(),
+            org_id: self.org_id.clone(),
+            original_name: self.original_name.clone(),
+            public_url: self.public_url.clone(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MediaBiz
+// ---------------------------------------------------------------------------
+
+pub struct MediaBiz {
+    repo: MediaRepository,
+    config: philand_configs::MediaServiceConfig,
+    storage: MediaStorage,
+    /// Internal storage client pointing directly at Garage (bypasses CDN/tunnel).
+    internal_storage: MediaStorage,
 }
 
 impl MediaBiz {
@@ -118,11 +139,20 @@ impl MediaBiz {
             .await
             .map_err(Self::map_internal_error)?;
 
-        Ok(Self {
-            repo,
-            config,
-            storage,
-        })
+        // Internal storage uses the direct endpoint (bypasses CDN/tunnel) for HEAD checks.
+        let internal_s3_cfg = philand_storage::S3Config {
+            endpoint: config.s3_internal_endpoint.clone(),
+            region: config.s3_region.clone(),
+            access_key: config.s3_access_key.clone(),
+            secret_key: config.s3_secret_key.clone(),
+            bucket: config.s3_bucket.clone(),
+            force_path_style: config.s3_force_path_style,
+        };
+        let internal_storage = MediaStorage::new(internal_s3_cfg)
+            .await
+            .map_err(Self::map_internal_error)?;
+
+        Ok(Self { repo, config, storage, internal_storage })
     }
 
     pub fn verify_token_subject(&self, token: &str) -> Result<String, Status> {
@@ -136,6 +166,7 @@ impl MediaBiz {
         file_name: String,
         content_type: String,
         size: u64,
+        org_id: Option<String>,
     ) -> Result<InitUploadOutput, Status> {
         validate_file_name(&file_name)?;
         validate_content_type(&self.config.allowed_content_type_prefixes, &content_type)?;
@@ -148,11 +179,7 @@ impl MediaBiz {
 
         let signed = self
             .storage
-            .presign_put(
-                &object_key,
-                self.config.upload_url_ttl_seconds,
-                now.timestamp(),
-            )
+            .presign_put(&object_key, self.config.upload_url_ttl_seconds, now.timestamp())
             .map_err(Self::map_internal_error)?;
 
         self.repo
@@ -166,7 +193,7 @@ impl MediaBiz {
                 declared_size: size as i64,
                 status: "init",
                 created_by: user_id,
-                org_id: None,
+                org_id: org_id.as_deref(),
                 expires_at: now
                     + chrono::Duration::seconds(self.config.upload_url_ttl_seconds as i64),
             })
@@ -197,17 +224,19 @@ impl MediaBiz {
             .ok_or_else(|| Status::not_found("upload not found"))?;
 
         if upload.created_by != user_id {
-            return Err(Status::permission_denied(
-                "upload does not belong to caller",
-            ));
+            return Err(Status::permission_denied("upload does not belong to caller"));
         }
 
         if upload.status == "ready" {
+            let public_url = self.build_public_url(&upload.bucket, &upload.object_key);
             return Ok(CompleteUploadOutput {
                 file_id: upload.file_id,
                 status: "ready".to_string(),
                 object_key: upload.object_key,
                 bucket: upload.bucket,
+                etag: String::new(),
+                confirmed_size: upload.uploaded_size.unwrap_or(0).max(0) as u64,
+                public_url,
             });
         }
 
@@ -215,15 +244,17 @@ impl MediaBiz {
             return Err(Status::failed_precondition("upload has expired"));
         }
 
-        let object_size = self.verify_object_exists(&upload.object_key).await?;
+        let (object_size, etag) = self.verify_object_exists(&upload.object_key).await?;
 
         self.repo
             .insert_file(CreateFileParams {
                 id: &upload.file_id,
                 bucket: &upload.bucket,
                 object_key: &upload.object_key,
+                original_name: &upload.original_name,
                 content_type: &upload.content_type,
                 size: object_size as i64,
+                etag: &etag,
                 status: "ready",
                 created_by: user_id,
                 org_id: upload.org_id.as_deref(),
@@ -236,11 +267,15 @@ impl MediaBiz {
             .await
             .map_err(Self::map_internal_error)?;
 
+        let public_url = self.build_public_url(&upload.bucket, &upload.object_key);
         Ok(CompleteUploadOutput {
             file_id: upload.file_id,
             status: "ready".to_string(),
             object_key: upload.object_key,
             bucket: upload.bucket,
+            etag,
+            confirmed_size: object_size,
+            public_url,
         })
     }
 
@@ -256,7 +291,46 @@ impl MediaBiz {
             return Err(Status::permission_denied("file does not belong to caller"));
         }
 
-        Ok(map_file_row(row))
+        Ok(map_file_row(row, &self.config.s3_public_base_url))
+    }
+
+    pub async fn list_files(
+        &self,
+        user_id: &str,
+        org_id: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ListFilesOutput, Status> {
+        let (rows, total) = self
+            .repo
+            .list_files_by_user(user_id, org_id, limit, offset)
+            .await
+            .map_err(Self::map_internal_error)?;
+
+        Ok(ListFilesOutput {
+            files: rows.into_iter().map(|r| map_file_row(r, &self.config.s3_public_base_url)).collect(),
+            total,
+        })
+    }
+
+    pub async fn delete_file(&self, user_id: &str, file_id: String) -> Result<(), Status> {
+        let row = self
+            .repo
+            .get_file_by_id(&file_id)
+            .await
+            .map_err(Self::map_internal_error)?
+            .ok_or_else(|| Status::not_found("file not found"))?;
+
+        if row.created_by != user_id {
+            return Err(Status::permission_denied("file does not belong to caller"));
+        }
+
+        self.repo
+            .soft_delete_file(&file_id)
+            .await
+            .map_err(Self::map_internal_error)?;
+
+        Ok(())
     }
 
     pub async fn get_file_download_url(
@@ -288,6 +362,16 @@ impl MediaBiz {
         })
     }
 
+    // ---------------------------------------------------------------------------
+    // Private helpers
+    // ---------------------------------------------------------------------------
+
+    fn build_public_url(&self, bucket: &str, object_key: &str) -> String {
+        let base = self.config.s3_public_base_url.trim_end_matches('/');
+        let key = object_key.trim_start_matches('/');
+        format!("{}/{}/{}", base, bucket, key)
+    }
+
     fn build_object_key(&self, user_id: &str, file_id: &str, file_name: &str) -> String {
         let now = Utc::now();
         let safe_name: String = file_name
@@ -311,11 +395,11 @@ impl MediaBiz {
         )
     }
 
-    async fn verify_object_exists(&self, object_key: &str) -> Result<u64, Status> {
-        self.storage
-            .head_object_size(object_key)
+    async fn verify_object_exists(&self, object_key: &str) -> Result<(u64, String), Status> {
+        self.internal_storage
+            .head_object(object_key)
             .await
-            .map_err(|_| Status::failed_precondition("uploaded object not found"))
+            .map_err(|_| Status::failed_precondition("uploaded object not found in S3"))
     }
 
     fn map_internal_error(error: impl ToString) -> Status {
@@ -323,18 +407,24 @@ impl MediaBiz {
     }
 }
 
-fn map_file_row(row: MediaFileRow) -> FileOutput {
+fn map_file_row(row: MediaFileRow, public_base_url: &str) -> FileOutput {
+    let key = row.object_key.trim_start_matches('/');
+    let public_url = format!(
+        "{}/{}/{}",
+        public_base_url.trim_end_matches('/'),
+        row.bucket,
+        key
+    );
     FileOutput {
         file_id: row.id,
         bucket: row.bucket,
         object_key: row.object_key,
         content_type: row.content_type,
+        original_name: row.original_name,
         size: row.size.max(0) as u64,
         status: row.status,
+        org_id: row.org_id.unwrap_or_default(),
         created_at: row.created_at.timestamp(),
+        public_url,
     }
-}
-
-pub fn timestamp_from_datetime(dt: DateTime<Utc>) -> i64 {
-    dt.timestamp()
 }

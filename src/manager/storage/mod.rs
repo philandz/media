@@ -55,49 +55,58 @@ impl MediaStorage {
         })
     }
 
-    pub async fn head_object_size(&self, object_key: &str) -> Result<u64, String> {
-        let signed = presign_get_object(&self.cfg, object_key, Duration::from_secs(300))
+    /// Verifies the object exists in S3 and returns (size_bytes, etag).
+    /// Uses a presigned GET with a short TTL — internal endpoint bypasses CDN.
+    pub async fn head_object(&self, object_key: &str) -> Result<(u64, String), String> {
+        let signed = presign_get_object(&self.cfg, object_key, Duration::from_secs(30))
             .map_err(|e| e.to_string())?;
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .http1_only()
+            .build()
+            .map_err(|e| e.to_string())?
             .get(signed)
-            .header(reqwest::header::RANGE, "bytes=0-0")
+            .header("Range", "bytes=0-0")
             .send()
             .await
             .map_err(|e| e.to_string())?;
 
-        if !(response.status().is_success()
-            || response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+        if !response.status().is_success()
+            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
         {
             return Err(format!(
-                "signed get failed with status {}",
+                "S3 object check failed with status {}",
                 response.status()
             ));
         }
 
-        if let Some(total) = response
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string();
+
+        // Content-Range: bytes 0-0/TOTAL
+        let size = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .and_then(parse_total_from_content_range)
-        {
-            return Ok(total);
-        }
-
-        response
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split('/').last())
             .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(|| "cannot detect object size from response headers".to_string())
+            .or_else(|| {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .ok_or_else(|| "cannot detect object size from response".to_string())?;
+
+        Ok((size, etag))
     }
 }
 
-fn parse_total_from_content_range(header_value: &str) -> Option<u64> {
-    // bytes 0-0/12345
-    let (_, total) = header_value.split_once('/')?;
-    if total == "*" {
-        return None;
-    }
-    total.parse::<u64>().ok()
-}
+

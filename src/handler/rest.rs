@@ -1,9 +1,9 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,11 @@ use crate::handler::MediaHandler;
 use crate::pb::service::media::media_service_server::MediaService;
 use crate::pb::service::media::{
     CompleteUploadRequest as PbCompleteUploadRequest,
+    DeleteFileRequest as PbDeleteFileRequest,
     GetFileDownloadUrlRequest as PbGetFileDownloadUrlRequest,
     GetFileRequest as PbGetFileRequest,
     InitUploadRequest as PbInitUploadRequest,
+    ListFilesRequest as PbListFilesRequest,
 };
 use crate::pb::shared::media::{MediaFileStatus, MediaUploadStatus};
 use philand_error::ErrorEnvelope;
@@ -28,7 +30,9 @@ pub fn router() -> Router<HttpState> {
     Router::new()
         .route("/uploads/init", post(init_upload))
         .route("/uploads/complete", post(complete_upload))
+        .route("/files", get(list_files))
         .route("/files/{id}", get(get_file))
+        .route("/files/{id}", delete(delete_file))
         .route("/files/{id}/download-url", get(get_file_download_url))
 }
 
@@ -40,11 +44,16 @@ pub async fn request_logging_middleware(request: axum::extract::Request, next: N
     response
 }
 
+// ---------------------------------------------------------------------------
+// Request / Response DTOs
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Deserialize)]
 pub struct InitUploadRequest {
     pub file_name: String,
     pub content_type: String,
     pub size: u64,
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +78,9 @@ pub struct CompleteUploadResponse {
     pub status: String,
     pub object_key: String,
     pub bucket: String,
+    pub etag: String,
+    pub confirmed_size: i64,
+    pub public_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,9 +89,18 @@ pub struct MediaFileResponse {
     pub bucket: String,
     pub object_key: String,
     pub content_type: String,
+    pub original_name: String,
     pub size: u64,
     pub status: String,
+    pub org_id: String,
+    pub public_url: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListFilesResponse {
+    pub files: Vec<MediaFileResponse>,
+    pub total: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +109,17 @@ pub struct FileDownloadUrlResponse {
     pub download_url: String,
     pub expires_at: i64,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ListFilesQuery {
+    pub org_id: Option<String>,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn map_status(status: Status) -> (StatusCode, Json<ErrorEnvelope>) {
     let (http, envelope) = philand_error::http_error_from_tonic_status(&status);
@@ -134,23 +166,42 @@ fn file_status_string(v: i32) -> String {
     .to_string()
 }
 
-fn upload_size_to_i64(size: u64) -> ApiResult<i64> {
-    i64::try_from(size)
-        .map_err(|_| map_status(Status::invalid_argument("size is too large to process")))
+fn map_file_proto(file: crate::pb::shared::media::MediaFile) -> MediaFileResponse {
+    let created_at = file.base.as_ref().map(|b| b.created_at).unwrap_or_default();
+    let file_id = file.base.map(|b| b.id).unwrap_or_default();
+    MediaFileResponse {
+        file_id,
+        bucket: file.bucket,
+        object_key: file.object_key,
+        content_type: file.content_type,
+        original_name: file.original_name,
+        size: file.size.max(0) as u64,
+        status: file_status_string(file.file_status),
+        org_id: file.org_id,
+        public_url: file.public_url,
+        created_at,
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 async fn init_upload(
     State(handler): State<HttpState>,
     headers: HeaderMap,
     Json(body): Json<InitUploadRequest>,
 ) -> ApiResult<(StatusCode, Json<InitUploadResponse>)> {
-    let size = upload_size_to_i64(body.size)?;
+    let size = i64::try_from(body.size)
+        .map_err(|_| map_status(Status::invalid_argument("size is too large")))?;
+
     let grpc_req = with_auth(
         &headers,
         PbInitUploadRequest {
             file_name: body.file_name,
             content_type: body.content_type,
             size,
+            org_id: body.org_id.unwrap_or_default(),
         },
     )?;
 
@@ -199,6 +250,35 @@ async fn complete_upload(
         status: upload_status_string(output.upload_status),
         object_key: output.object_key,
         bucket: output.bucket,
+        etag: output.etag,
+        confirmed_size: output.confirmed_size,
+        public_url: output.public_url,
+    }))
+}
+
+async fn list_files(
+    State(handler): State<HttpState>,
+    headers: HeaderMap,
+    Query(params): Query<ListFilesQuery>,
+) -> ApiResult<Json<ListFilesResponse>> {
+    let grpc_req = with_auth(
+        &headers,
+        PbListFilesRequest {
+            org_id: params.org_id.unwrap_or_default(),
+            limit: params.limit.unwrap_or(20),
+            offset: params.offset.unwrap_or(0),
+        },
+    )?;
+
+    let output = handler
+        .list_files(grpc_req)
+        .await
+        .map_err(map_status)?
+        .into_inner();
+
+    Ok(Json(ListFilesResponse {
+        files: output.files.into_iter().map(map_file_proto).collect(),
+        total: output.total,
     }))
 }
 
@@ -219,18 +299,22 @@ async fn get_file(
         .file
         .ok_or_else(|| map_status(Status::not_found("file not found")))?;
 
-    let created_at = file.base.as_ref().map(|v| v.created_at).unwrap_or_default();
-    let file_id = file.base.map(|v| v.id).unwrap_or_default();
+    Ok(Json(map_file_proto(file)))
+}
 
-    Ok(Json(MediaFileResponse {
-        file_id,
-        bucket: file.bucket,
-        object_key: file.object_key,
-        content_type: file.content_type,
-        size: file.size.max(0) as u64,
-        status: file_status_string(file.file_status),
-        created_at,
-    }))
+async fn delete_file(
+    State(handler): State<HttpState>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let grpc_req = with_auth(&headers, PbDeleteFileRequest { file_id })?;
+
+    handler
+        .delete_file(grpc_req)
+        .await
+        .map_err(map_status)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_file_download_url(
