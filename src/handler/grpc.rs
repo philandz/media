@@ -5,9 +5,9 @@ use tonic::{Request, Response, Status};
 use crate::manager::biz::MediaBiz;
 use crate::pb::service::media::media_service_server::MediaService;
 use crate::pb::service::media::{
-    CompleteUploadRequest, CompleteUploadResponse, GetFileDownloadUrlRequest,
-    GetFileDownloadUrlResponse, GetFileRequest, GetFileResponse, InitUploadRequest,
-    InitUploadResponse,
+    CompleteUploadRequest, CompleteUploadResponse, DeleteFileRequest, DeleteFileResponse,
+    GetFileDownloadUrlRequest, GetFileDownloadUrlResponse, GetFileRequest, GetFileResponse,
+    InitUploadRequest, InitUploadResponse, ListFilesRequest, ListFilesResponse,
 };
 
 use super::metadata::extract_bearer_token;
@@ -32,16 +32,16 @@ impl MediaService for MediaHandler {
         let user_id = self.biz.verify_token_subject(&token)?;
         let req = request.into_inner();
 
-        if req.size < 0 {
-            return Err(Status::invalid_argument("size must be non-negative"));
+        if req.size <= 0 {
+            return Err(Status::invalid_argument("size must be greater than 0"));
         }
+
+        let org_id = if req.org_id.is_empty() { None } else { Some(req.org_id) };
 
         let output = self
             .biz
-            .init_upload(&user_id, req.file_name, req.content_type, req.size as u64)
+            .init_upload(&user_id, req.file_name, req.content_type, req.size as u64, org_id)
             .await?;
-
-        let required_content_type = output.required_content_type();
 
         Ok(Response::new(InitUploadResponse {
             upload_id: output.upload_id,
@@ -50,7 +50,7 @@ impl MediaService for MediaHandler {
             object_key: output.object_key,
             presigned_url: output.presigned_url,
             expires_at: output.expires_at,
-            required_content_type,
+            required_content_type: output.content_type,
         }))
     }
 
@@ -63,13 +63,16 @@ impl MediaService for MediaHandler {
         let req = request.into_inner();
 
         let output = self.biz.complete_upload(&user_id, req.upload_id).await?;
-        let upload_status = output.upload_status_enum();
 
+        let upload_status = output.upload_status_enum();
         Ok(Response::new(CompleteUploadResponse {
             file_id: output.file_id,
             bucket: output.bucket,
             object_key: output.object_key,
             upload_status,
+            etag: output.etag,
+            confirmed_size: output.confirmed_size as i64,
+            public_url: output.public_url,
         }))
     }
 
@@ -96,12 +99,55 @@ impl MediaService for MediaHandler {
         let user_id = self.biz.verify_token_subject(&token)?;
         let req = request.into_inner();
 
-        let output = self.biz.get_file_download_url(&user_id, req.file_id).await?;
+        let output = self
+            .biz
+            .get_file_download_url(&user_id, req.file_id)
+            .await?;
 
         Ok(Response::new(GetFileDownloadUrlResponse {
             file_id: output.file_id,
             download_url: output.download_url,
             expires_at: output.expires_at,
         }))
+    }
+
+    async fn list_files(
+        &self,
+        request: Request<ListFilesRequest>,
+    ) -> Result<Response<ListFilesResponse>, Status> {
+        let token = extract_bearer_token(&request)?;
+        let user_id = self.biz.verify_token_subject(&token)?;
+        let req = request.into_inner();
+
+        let org_id = if req.org_id.is_empty() {
+            None
+        } else {
+            Some(req.org_id)
+        };
+        let limit = if req.limit <= 0 { 20 } else { req.limit as u32 };
+        let offset = req.offset.max(0) as u32;
+
+        let output = self
+            .biz
+            .list_files(&user_id, org_id.as_deref(), limit, offset)
+            .await?;
+
+        Ok(Response::new(ListFilesResponse {
+            files: output.files.into_iter().map(|f| f.to_proto(&user_id)).collect(),
+            total: output.total as i32,
+        }))
+    }
+
+    async fn delete_file(
+        &self,
+        request: Request<DeleteFileRequest>,
+    ) -> Result<Response<DeleteFileResponse>, Status> {
+        let token = extract_bearer_token(&request)?;
+        let user_id = self.biz.verify_token_subject(&token)?;
+        let req = request.into_inner();
+
+        self.biz.delete_file(&user_id, req.file_id).await?;
+
+        Ok(Response::new(DeleteFileResponse {}))
     }
 }
