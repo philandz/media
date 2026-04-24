@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use tonic::Status;
 
 pub fn validate_file_name(file_name: &str) -> Result<(), Status> {
