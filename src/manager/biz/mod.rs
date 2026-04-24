@@ -1,3 +1,4 @@
+#![allow(clippy::result_large_err)]
 pub mod token;
 
 use chrono::{Datelike, Utc};
@@ -58,6 +59,12 @@ pub struct FileDownloadUrlOutput {
     pub file_id: String,
     pub download_url: String,
     pub expires_at: i64,
+}
+
+pub struct PublicObjectOutput {
+    pub object_key: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +159,12 @@ impl MediaBiz {
             .await
             .map_err(Self::map_internal_error)?;
 
-        Ok(Self { repo, config, storage, internal_storage })
+        Ok(Self {
+            repo,
+            config,
+            storage,
+            internal_storage,
+        })
     }
 
     pub fn verify_token_subject(&self, token: &str) -> Result<String, Status> {
@@ -179,7 +191,11 @@ impl MediaBiz {
 
         let signed = self
             .storage
-            .presign_put(&object_key, self.config.upload_url_ttl_seconds, now.timestamp())
+            .presign_put(
+                &object_key,
+                self.config.upload_url_ttl_seconds,
+                now.timestamp(),
+            )
             .map_err(Self::map_internal_error)?;
 
         self.repo
@@ -224,7 +240,9 @@ impl MediaBiz {
             .ok_or_else(|| Status::not_found("upload not found"))?;
 
         if upload.created_by != user_id {
-            return Err(Status::permission_denied("upload does not belong to caller"));
+            return Err(Status::permission_denied(
+                "upload does not belong to caller",
+            ));
         }
 
         if upload.status == "ready" {
@@ -308,7 +326,10 @@ impl MediaBiz {
             .map_err(Self::map_internal_error)?;
 
         Ok(ListFilesOutput {
-            files: rows.into_iter().map(|r| map_file_row(r, &self.config.s3_public_base_url)).collect(),
+            files: rows
+                .into_iter()
+                .map(|r| map_file_row(r, &self.config.s3_public_base_url))
+                .collect(),
             total,
         })
     }
@@ -359,6 +380,36 @@ impl MediaBiz {
             file_id: row.id,
             download_url: signed.url,
             expires_at: signed.expires_at,
+        })
+    }
+
+    pub async fn get_public_object_by_key(
+        &self,
+        object_key: &str,
+    ) -> Result<PublicObjectOutput, Status> {
+        let normalized = object_key.trim_start_matches('/');
+        let maybe_row = self
+            .repo
+            .get_file_by_object_key(normalized)
+            .await
+            .map_err(Self::map_internal_error)?;
+
+        if let Some(row) = maybe_row {
+            if row.status != "ready" {
+                return Err(Status::failed_precondition("file not ready"));
+            }
+        }
+
+        let (bytes, content_type) = self
+            .internal_storage
+            .get_object_bytes(normalized)
+            .await
+            .map_err(Self::map_internal_error)?;
+
+        Ok(PublicObjectOutput {
+            object_key: normalized.to_string(),
+            content_type,
+            bytes,
         })
     }
 
