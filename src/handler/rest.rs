@@ -1,6 +1,7 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
     routing::{delete, get, post},
@@ -13,12 +14,9 @@ use tonic::{metadata::MetadataValue, Request as GrpcRequest, Status};
 use crate::handler::MediaHandler;
 use crate::pb::service::media::media_service_server::MediaService;
 use crate::pb::service::media::{
-    CompleteUploadRequest as PbCompleteUploadRequest,
-    DeleteFileRequest as PbDeleteFileRequest,
-    GetFileDownloadUrlRequest as PbGetFileDownloadUrlRequest,
-    GetFileRequest as PbGetFileRequest,
-    InitUploadRequest as PbInitUploadRequest,
-    ListFilesRequest as PbListFilesRequest,
+    CompleteUploadRequest as PbCompleteUploadRequest, DeleteFileRequest as PbDeleteFileRequest,
+    GetFileDownloadUrlRequest as PbGetFileDownloadUrlRequest, GetFileRequest as PbGetFileRequest,
+    InitUploadRequest as PbInitUploadRequest, ListFilesRequest as PbListFilesRequest,
 };
 use crate::pb::shared::media::{MediaFileStatus, MediaUploadStatus};
 use philand_error::ErrorEnvelope;
@@ -34,6 +32,7 @@ pub fn router() -> Router<HttpState> {
         .route("/files/{id}", get(get_file))
         .route("/files/{id}", delete(delete_file))
         .route("/files/{id}/download-url", get(get_file_download_url))
+        .route("/public/{*object_key}", get(get_public_object))
 }
 
 pub async fn request_logging_middleware(request: axum::extract::Request, next: Next) -> Response {
@@ -309,10 +308,7 @@ async fn delete_file(
 ) -> ApiResult<StatusCode> {
     let grpc_req = with_auth(&headers, PbDeleteFileRequest { file_id })?;
 
-    handler
-        .delete_file(grpc_req)
-        .await
-        .map_err(map_status)?;
+    handler.delete_file(grpc_req).await.map_err(map_status)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -335,4 +331,27 @@ async fn get_file_download_url(
         download_url: output.download_url,
         expires_at: output.expires_at,
     }))
+}
+
+async fn get_public_object(
+    State(handler): State<HttpState>,
+    Path(object_key): Path<String>,
+) -> ApiResult<Response> {
+    let output = handler
+        .get_public_object_by_key(&object_key)
+        .await
+        .map_err(map_status)?;
+
+    let mut response = Response::new(Body::from(output.bytes));
+    *response.status_mut() = StatusCode::OK;
+    let content_type = HeaderValue::from_str(&output.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    response
+        .headers_mut()
+        .insert(axum::http::header::CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    Ok(response)
 }

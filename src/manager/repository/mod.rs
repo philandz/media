@@ -222,6 +222,24 @@ impl MediaRepository {
         .await
     }
 
+    pub async fn get_file_by_object_key(
+        &self,
+        object_key: &str,
+    ) -> Result<Option<MediaFileRow>, sqlx::Error> {
+        sqlx::query_as::<_, MediaFileRow>(
+            r#"
+            SELECT id, bucket, object_key, original_name, content_type,
+                   size, etag, status, created_by, org_id, created_at
+            FROM media_files
+            WHERE object_key = ? AND status != 'deleted'
+            LIMIT 1
+            "#,
+        )
+        .bind(object_key)
+        .fetch_optional(&*self.pool)
+        .await
+    }
+
     pub async fn list_files_by_user(
         &self,
         user_id: &str,

@@ -94,7 +94,7 @@ impl MediaStorage {
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split('/').last())
+            .and_then(|v| v.split('/').next_back())
             .and_then(|v| v.parse::<u64>().ok())
             .or_else(|| {
                 response
@@ -107,6 +107,37 @@ impl MediaStorage {
 
         Ok((size, etag))
     }
+
+    /// Downloads the full object content via an internal presigned GET.
+    pub async fn get_object_bytes(&self, object_key: &str) -> Result<(Vec<u8>, String), String> {
+        let signed = presign_get_object(&self.cfg, object_key, Duration::from_secs(30))
+            .map_err(|e| e.to_string())?;
+
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .http1_only()
+            .build()
+            .map_err(|e| e.to_string())?
+            .get(signed)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "S3 object download failed with status {}",
+                response.status()
+            ));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        Ok((bytes.to_vec(), content_type))
+    }
 }
-
-

@@ -20,6 +20,13 @@ impl MediaHandler {
     pub fn new(biz: Arc<MediaBiz>) -> Self {
         Self { biz }
     }
+
+    pub async fn get_public_object_by_key(
+        &self,
+        object_key: &str,
+    ) -> Result<crate::manager::biz::PublicObjectOutput, Status> {
+        self.biz.get_public_object_by_key(object_key).await
+    }
 }
 
 #[tonic::async_trait]
@@ -36,11 +43,21 @@ impl MediaService for MediaHandler {
             return Err(Status::invalid_argument("size must be greater than 0"));
         }
 
-        let org_id = if req.org_id.is_empty() { None } else { Some(req.org_id) };
+        let org_id = if req.org_id.is_empty() {
+            None
+        } else {
+            Some(req.org_id)
+        };
 
         let output = self
             .biz
-            .init_upload(&user_id, req.file_name, req.content_type, req.size as u64, org_id)
+            .init_upload(
+                &user_id,
+                req.file_name,
+                req.content_type,
+                req.size as u64,
+                org_id,
+            )
             .await?;
 
         Ok(Response::new(InitUploadResponse {
@@ -133,7 +150,11 @@ impl MediaService for MediaHandler {
             .await?;
 
         Ok(Response::new(ListFilesResponse {
-            files: output.files.into_iter().map(|f| f.to_proto(&user_id)).collect(),
+            files: output
+                .files
+                .into_iter()
+                .map(|f| f.to_proto(&user_id))
+                .collect(),
             total: output.total as i32,
         }))
     }
