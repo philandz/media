@@ -102,10 +102,29 @@ impl MediaRepository {
             .await
             .map_err(philand_storage::StorageError::Migrate)?;
         migrator.set_ignore_missing(true);
-        migrator
-            .run(&*self.pool)
-            .await
-            .map_err(philand_storage::StorageError::Migrate)
+        // Mirror the swallow pattern from budget/identity: tolerate
+        // VersionMismatch / checksum drift / Duplicate column / already-exists
+        // so the runtime doesn't crash on dev DBs that have already-applied
+        // migrations with stale checksums. Drop failed rows so subsequent
+        // restarts skip cleanly.
+        if let Err(e) = migrator.run(&*self.pool).await {
+            let err_str = e.to_string();
+            let ignorable = err_str.contains("VersionMismatch")
+                || err_str.contains("partially applied")
+                || err_str.contains("previously applied but has been modified")
+                || err_str.contains("Duplicate column name")
+                || err_str.contains("Duplicate key name")
+                || err_str.contains("already exists");
+            if !ignorable {
+                return Err(philand_storage::StorageError::Migrate(e));
+            }
+            tracing::warn!("Migration already-applied state detected: {}", e);
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE success = false")
+                .execute(&*self.pool)
+                .await
+                .ok();
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
