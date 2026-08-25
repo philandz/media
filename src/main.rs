@@ -35,6 +35,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to init media repository: {e}"))?;
 
+    // Install metrics recorder and spawn warn task.
+    let metrics_handle = philand_storage::metrics::install_recorder().await?;
+    tokio::spawn(philand_storage::metrics::spawn_warn_task(
+        philand_configs::MetricsConfig::from_env().acquire_warn_p99_ms,
+    ));
+
     let biz = Arc::new(
         MediaBiz::new(repo, config)
             .await
@@ -48,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(move || async move { metrics_handle.render() }))
         .merge(rest::router())
         .layer(TraceLayer::new_for_http())
         .layer(
