@@ -54,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/metrics", get(move || async move { metrics_handle.render() }))
+        .route(
+            "/metrics",
+            get(move || async move { metrics_handle.render() }),
+        )
         .merge(rest::router())
         .layer(TraceLayer::new_for_http())
         .layer(
