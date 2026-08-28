@@ -30,3 +30,4 @@ philand_configs = { package = "configs", path = "../libs/configs" }
 philand_storage = { package = "storage", path = "../libs/storage" }
 philand_application = { package = "application", path = "../libs/application" }
 philand_crypto = { package = "crypto", path = "../libs/crypto" }
+metrics-exporter-prometheus = "0.15"
