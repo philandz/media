@@ -98,14 +98,10 @@ impl MediaRepository {
     }
 
     async fn run_migrations(&self) -> Result<(), philand_storage::StorageError> {
-        let mut migrator = sqlx::migrate::Migrator::new(std::path::Path::new("./migrations"))
+        philand_storage::migrate::run_idempotent(&self.pool, "./migrations")
             .await
             .map_err(philand_storage::StorageError::Migrate)?;
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&*self.pool)
-            .await
-            .map_err(philand_storage::StorageError::Migrate)
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
